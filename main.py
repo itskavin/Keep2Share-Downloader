@@ -1,289 +1,201 @@
 import os
-import io
 import re
-import json
-import math
+import sys
 import time
-import random
-import pathlib
+import math
 import argparse
 import threading
-import contextlib
-import subprocess
-from shutil import which
-from typing import Dict, List
-
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+from typing import List, Dict
 
 import k2s
-from utils import get_working_proxies
+from utils import ProxyManager, parse_size, human_readable_bytes
 
-WORKING_PROXY_LIST = []
-PROXIES = get_working_proxies()
-PROXIES_LOCK = [threading.Lock() for _ in range(len(PROXIES))]
+class Downloader:
+    def __init__(self, url: str, filename: str = None, split_size: int = 20 * 1024 * 1024, threads: int = 5, use_proxies: bool = True, refresh_proxies: bool = False):
+        self.url = url
+        self.filename = filename
+        self.split_size = split_size
+        self.threads = threads
+        self.use_proxies = use_proxies
+        self.refresh_proxies = refresh_proxies
+        
+        self.proxy_manager = ProxyManager() if use_proxies else None
+        self.k2s_api = k2s.K2SAPI(self.proxy_manager)
+        self.file_id = self._extract_file_id(url)
+        
+        if not self.file_id:
+            raise ValueError("Invalid K2S URL")
 
-URL_LOCKS = None
-START_TIME = time.time()
+    def _extract_file_id(self, url: str) -> str:
+        m = re.search(r"https:\/\/(k2s.cc|keep2share.cc)\/file\/([a-zA-Z0-9]+)", url)
+        return m.group(2) if m else None
 
-BYTES_PER_SPLIT = 1024 * 1024 * 16
-BLOCK_SIZE = 1024 * 32
-
-def parse_size(size: str) -> int:
-    units = {"B": 1, "KB": 2**10, "MB": 2**20, "GB": 2**30, "TB": 2**40 ,
-             "":  1, "KIB": 10**3, "MIB": 10**6, "GIB": 10**9, "TIB": 10**12}
-    m = re.match(r'^([\d\.]+)\s*([a-zA-Z]{0,3})$', str(size).strip())
-    number, unit = float(m.group(1)), m.group(2).upper()
-    return int(number*units[unit])
-
-def human_readable_bytes(num: int) -> str:
-    for x in ['bytes', 'KB', 'MB', 'GB', 'TB']:
-        if num < 1024.0:
-            return "%3.3f %s" % (num, x)
-        num /= 1024.0
-
-def buildRange(value: int, numsplits: int) -> Dict:
-
-    range_dict = {}
-    for i in range(numsplits):
-        range_dict.update({
-            str(i): {
-                "inUse": False,
-                "downloaded": False,
-                "range": '%s-%s' % (int(round(1 + i * value/(numsplits*1.0), 0)), int(round(1 + i * value/(numsplits*1.0) + value/(numsplits*1.0)-1, 0))),
-                "bytes": (int(round(1 + i * value/(numsplits*1.0) + value/(numsplits*1.0)-1, 0)) - int(round(1 + i * value/(numsplits*1.0),0)) + 1)
-            }
-        })
-
-    range_dict["0"]["range"] = "0-" + str(int(range_dict["0"]["range"].split("-")[1]))
-    range_dict["0"]["bytes"] = int(range_dict["0"]["bytes"]) + 1
-
-    return range_dict
-
-
-def main(urls: List[str], filename: str) -> None:
-    
-    if not urls:
-        print("Please Enter some url to begin download.")
-        return
-
-    headers = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36"}
-    stop = False
-    done_count = 0
-
-    sizeInBytes = requests.head(urls[-1], allow_redirects=True, headers=headers).headers.get('Content-Length', None)
-    if not sizeInBytes:
-        print("Size cannot be determined.")
-        return
-
-    print(f"{human_readable_bytes(int(sizeInBytes))} to download.")
-
-    # Split total num bytes into ranges
-    splitBy = math.ceil(int(sizeInBytes) / BYTES_PER_SPLIT)
-    ranges = buildRange(int(sizeInBytes), splitBy)
-    sizePerRange = int(round(1 + 0 * int(sizeInBytes)/(splitBy*1.0) + int(sizeInBytes)/(splitBy*1.0)-1, 0))
-    total_iter = tqdm(desc=f"[{done_count}/{len(ranges)}] Downloaded", total=int(sizeInBytes), unit='iB', unit_scale=True, unit_divisor=1024)
-    
-    def downloadChunk(idx, irange, th_idx):
-
-        nonlocal done_count
-        chunk_start_time = time.time()
-        total_size_in_bytes= int(sizePerRange)
-        tmp_filename = os.path.join("tmp", f"{filename}.part{str(idx).zfill(len(str(splitBy)))}")
-        str_range = "-".join([human_readable_bytes(int(bytes)) for bytes in irange.split('-')])
-        f = io.BytesIO()
-        progress_bar = None
-        proxy_idx = 0
-
-        for i in WORKING_PROXY_LIST:
-            if not PROXIES_LOCK[i].locked():
-                proxy_idx = i
-                break
-            else:
-                proxy_idx = random.randint(0, len(PROXIES) - 1)
-
-        while PROXIES_LOCK[proxy_idx].locked():
-            proxy_idx = random.randint(0, len(PROXIES) - 1)
-
-        PROXIES_LOCK[proxy_idx].acquire()
-
-        if PROXIES[proxy_idx]:
-            prox = {'https': f'http://{PROXIES[proxy_idx]}'}
-            prefix = f"[{PROXIES[proxy_idx]}]"
-        else:
-            prox = None
-            prefix = "[LOCAL]"
-        # progress_bar = tqdm(desc=f"{prefix} {str_range}", total=total_size_in_bytes, unit='iB', unit_scale=True, unit_divisor=1024, leave=False)
-
-        with contextlib.suppress(Exception):
-            req = requests.get(
-                urls[th_idx],
-                headers={"Range": f"bytes={irange}", "User-Agent": headers["User-Agent"]},
-                stream=True,
-                proxies=prox,
-                timeout=20
-            )
-
-            for data in req.iter_content(BLOCK_SIZE):
-                if stop: break
-                if chunk_start_time + 20 < time.time(): break
-                chunk_start_time = time.time()
-                # progress_bar.update(len(data))
-                total_iter.update(len(data))
-                f.write(data)
-
-        if not math.isclose(len(f.getvalue()), ranges[idx]["bytes"], abs_tol=1):
-            # progress_bar.close()
-            total_iter.update(-len(f.getvalue()))
-            ranges[idx]["inUse"] = False
-            URL_LOCKS[th_idx].release()
-            PROXIES_LOCK[proxy_idx].release()
+    def start(self):
+        print(f"Initializing download for ID: {self.file_id}")
+        
+        # 1. Get File Info
+        try:
+            if not self.filename:
+                self.filename = self.k2s_api.get_name(self.file_id)
+            print(f"Target Filename: {self.filename}")
+        except k2s.FileNotFoundError:
+            print("Error: File not found on Keep2Share.")
+            return
+        except Exception as e:
+            print(f"Error getting file info: {e}")
             return
 
-        with open(tmp_filename, "wb") as fr:
-            fr.write(f.getvalue())
+        # 2. Prepare Proxies
+        if self.use_proxies and self.proxy_manager:
+            if self.refresh_proxies or not self.proxy_manager.get_all():
+                print("Fetching new proxies...")
+                self.proxy_manager.fetch_proxies()
+            else:
+                print(f"Using {len(self.proxy_manager.get_all())} existing proxies.")
+        else:
+            print("Proxies disabled. Using direct connection.")
+        
+        # 3. Generate Download Links
+        try:
+            # We need enough links for threads? Or just one valid link?
+            # K2S free links might expire or be IP bound.
+            # Let's try to get a few links.
+            download_urls = self.k2s_api.generate_download_urls(self.file_id, count=self.threads)
+        except k2s.FileNotFoundError:
+            print("Error: File not found during link generation.")
+            return
+        except Exception as e:
+            print(f"Error generating links: {e}")
+            return
 
-        if proxy_idx not in WORKING_PROXY_LIST:
-            WORKING_PROXY_LIST.append(proxy_idx)
-        # progress_bar.close()
-        ranges[idx]["inUse"] = False
-        ranges[idx]["downloaded"] = True
-        done_count += 1
-        total_iter.desc = f"[{done_count}/{len(ranges)}] Downloaded"
-        URL_LOCKS[th_idx].release()
-        PROXIES_LOCK[proxy_idx].release()
+        if not download_urls:
+            print("No download URLs generated.")
+            return
 
-    try:
-        while done_count < len(ranges):
-            for idx, irange in ranges.items():
-                if irange["inUse"] or irange["downloaded"]:
-                    continue
+        # 4. Get File Size from one of the links
+        try:
+            head = requests.head(download_urls[0], allow_redirects=True)
+            total_size = int(head.headers.get('content-length', 0))
+        except:
+            print("Could not determine file size.")
+            return
 
-                tmp_filename = os.path.join("tmp", f"{filename}.part{str(idx).zfill(len(str(splitBy)))}")
-                if os.path.exists(tmp_filename):
-                    og_data = open(tmp_filename, "rb").read()
-                    if math.isclose(len(og_data), ranges[idx]["bytes"], abs_tol=1):
-                        if not irange["downloaded"]:
-                            total_iter.update(ranges[idx]["bytes"])
-                            done_count += 1
-                            total_iter.desc = f"[{done_count}/{len(ranges)}] Downloaded"
-                            irange["downloaded"] = True
-                            continue
-                    else:
-                        os.remove(tmp_filename)
+        print(f"File Size: {human_readable_bytes(total_size)}")
+        
+        # 5. Prepare Chunks
+        num_splits = math.ceil(total_size / self.split_size)
+        print(f"Splitting into {num_splits} chunks of {human_readable_bytes(self.split_size)}")
+        
+        pathlib_tmp = os.path.join("tmp")
+        os.makedirs(pathlib_tmp, exist_ok=True)
+        
+        chunks = []
+        for i in range(num_splits):
+            start = i * self.split_size
+            end = min((i + 1) * self.split_size - 1, total_size - 1)
+            chunks.append({
+                'id': i,
+                'start': start,
+                'end': end,
+                'size': end - start + 1,
+                'filename': os.path.join(pathlib_tmp, f"{self.filename}.part{str(i).zfill(3)}")
+            })
 
-                for th_idx in range(batch_count):
-                    if URL_LOCKS[th_idx].locked():
+        # 6. Download Loop
+        pbar = tqdm(total=total_size, unit='B', unit_scale=True, desc=self.filename)
+        
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = []
+            for chunk in chunks:
+                # Check if already downloaded
+                if os.path.exists(chunk['filename']):
+                    if os.path.getsize(chunk['filename']) == chunk['size']:
+                        pbar.update(chunk['size'])
                         continue
+                    else:
+                        os.remove(chunk['filename'])
+                
+                # Assign a URL to this chunk (round robin)
+                url = download_urls[chunk['id'] % len(download_urls)]
+                futures.append(executor.submit(self._download_chunk, url, chunk, pbar))
+            
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Chunk download failed: {e}")
+                    # Retry logic could go here
+        
+        pbar.close()
+        
+        # 7. Assemble
+        self._assemble_file(chunks)
 
-                    URL_LOCKS[th_idx].acquire()
-                    irange["inUse"] = True
-                    threading.Thread(target=downloadChunk, args=(idx, irange["range"], th_idx), daemon=True).start()
-                    break
-
-    except KeyboardInterrupt:
-        stop = True
-        os.system("cls")
-        print("Download Stopped")
-        return
-
-    for lock in URL_LOCKS:
-        while lock.locked():
-            lock.release()
-
-    for lock in PROXIES_LOCK:
-        while lock.locked():
-            lock.release()
-
-    total_iter.close()
-    print("--- %s seconds ---" % int(time.time() - START_TIME))
-
-    if os.path.exists(filename):
-        os.remove(filename)
-
-    # Reassemble file in correct order
-    with open(filename, 'wb') as fh:
-        for idx in range(len(ranges)):
-            tmp_filename = os.path.join("tmp", f"{filename}.part{str(idx).zfill(len(str(splitBy)))}")
-            with open(tmp_filename, "rb") as fr:
-                fh.write(fr.read())
-            os.remove(tmp_filename)
-
-    print("Finished Writing file %s" % filename)
-    print('File Size: {} bytes'.format(human_readable_bytes(os.path.getsize(filename))))
-
-def check_vid(video_path: pathlib.Path) -> bool:
-    output = subprocess.check_output(f'ffmpeg -i {video_path} -c copy -f null /dev/null -v warning', shell=True, stderr=subprocess.STDOUT)
-    return not bool(output)
-
-
-if __name__ == '__main__':
-
-    parser = argparse.ArgumentParser(description='K2S Downloader')
-    parser.add_argument('url', help='k2s url to download', action='store')
-    parser.add_argument('--filename', type=str,
-                        help='filename to save as',
-                        action='store', dest='filename')
-    parser.add_argument('--threads', dest='batch_count', action='store',
-                        help='number of connections to use (default 20)', default=20)
-    parser.add_argument('--split-size', dest='size', action='store',
-                        help='Size to split at (default 20M)', default=1024 * 1024 * 20)
-
-    args = parser.parse_args()
-
-    if "k2s.cc" not in args.url:
-        print("Invalid URL")
-        exit()
-
-    pathlib.Path("tmp").mkdir(parents=True, exist_ok=True)
-    file_id = re.findall(r"https:\/\/(k2s.cc|keep2share.cc)\/file\/(.*?)(\?|\/|$)", args.url)
-    if not file_id:
-        print("Invalid URL")
-        exit()
-
-    if parse_size(args.size) < 1024 * 1024 * 20:
-        print("Split size must be at least 20M")
-        exit()
-
-    file_id = file_id[0][1]
-    if not args.filename:
-        file_name = k2s.get_name(file_id)
-    else:
-        file_name = args.filename
-    batch_count = int(args.batch_count)
-    BYTES_PER_SPLIT = parse_size(args.size)
-
-    if not pathlib.Path("urls.json").exists():
-        with open("urls.json", "w") as f:
-            json.dump({}, f)
-
-    with open("urls.json", "r") as f:
-        past_urls = json.load(f)
-
-    urls = []
-    if file_id in past_urls:
-        urls = past_urls[file_id]
-
-    if len(urls) < batch_count:
-        urls = k2s.generate_download_urls(file_id, batch_count)
-
-    past_urls[file_id] = urls
-    with open("urls.json", "w") as f:
-        json.dump(past_urls, f, indent=4)
-
-    URL_LOCKS = [threading.Lock() for _ in range(batch_count)]
-    START_TIME = time.time()
-    redownloaded = False
-
-    while True:
-        main(urls, file_name)
-        if which("ffmpeg"):
-            if not check_vid(pathlib.Path(file_name)):
-                if not redownloaded:
-                    print("Video is corrupted. Redownloading with a larger chunk size.")
-                    redownloaded = True
-                    BYTES_PER_SPLIT *= 2
+    def _download_chunk(self, url: str, chunk: Dict, pbar: tqdm):
+        headers = {'Range': f"bytes={chunk['start']}-{chunk['end']}"}
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(url, headers=headers, stream=True, timeout=30)
+                r.raise_for_status()
+                with open(chunk['filename'], 'wb') as f:
+                    for data in r.iter_content(chunk_size=8192):
+                        f.write(data)
+                        pbar.update(len(data))
+                return
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code in [429, 509, 503]:
+                    wait_time = (attempt + 1) * 5
+                    # print(f"Rate limited (chunk {chunk['id']}). Waiting {wait_time}s...")
+                    time.sleep(wait_time)
                     continue
+                raise Exception(f"HTTP Error chunk {chunk['id']}: {e}")
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise Exception(f"Failed to download chunk {chunk['id']}: {e}")
+                time.sleep(2)
+
+    def _assemble_file(self, chunks: List[Dict]):
+        print("Assembling file...")
+        if os.path.exists(self.filename):
+            os.remove(self.filename)
+            
+        with open(self.filename, 'wb') as outfile:
+            for chunk in chunks:
+                if os.path.exists(chunk['filename']):
+                    with open(chunk['filename'], 'rb') as infile:
+                        outfile.write(infile.read())
+                    os.remove(chunk['filename'])
                 else:
-                    print("Video is still corrupted. Skipping.")
-        break
+                    print(f"Missing chunk {chunk['id']}!")
+                    return
+        
+        print(f"Download complete: {self.filename}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Clean K2S Downloader')
+    parser.add_argument('url', help='K2S URL')
+    parser.add_argument('--filename', help='Output filename')
+    parser.add_argument('--split-size', default='20MB', help='Chunk size (e.g. 10MB)')
+    parser.add_argument('--threads', type=int, default=1, help='Number of threads (Default: 1 for free downloads)')
+    parser.add_argument('--no-proxy', action='store_true', help='Disable proxies and use direct connection')
+    parser.add_argument('--refresh', action='store_true', help='Refresh proxy list')
+    
+    args = parser.parse_args()
+    
+    try:
+        downloader = Downloader(
+            url=args.url,
+            filename=args.filename,
+            split_size=parse_size(args.split_size),
+            threads=args.threads,
+            use_proxies=not args.no_proxy,
+            refresh_proxies=args.refresh
+        )
+        downloader.start()
+    except Exception as e:
+        print(f"Error: {e}")
